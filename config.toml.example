@@ -1,0 +1,86 @@
+# Quarantine Sentinel — configuration template
+# Copy this file to config.toml and fill in your values. config.toml is
+# git-ignored, so your credentials and internal data never get committed.
+
+# Recipients whose quarantined mail is skipped entirely on the local side.
+# This does not change anything on PMG; for these addresses, neither mail
+# content nor LLM requests are made. Comparison is case-insensitive.
+rcpt_ignore = [
+  # "monitoring@example.com",
+  # "newsletter@example.com",
+]
+
+# ---------------------------------------------------------------------------
+# Tuning
+# ---------------------------------------------------------------------------
+
+# Path to the SQLite state database.
+# Mails already in this DB are skipped on subsequent runs (no re-scoring).
+db_path = "quarantine_sentinel.db"
+
+# Only consider mails quarantined within this many days (PMG default retention = 7).
+lookback_days = 7
+
+# Minimum ham-confidence (0.0–1.0) to include a mail in the false-positive digest.
+# 0.70 means "70% confident this is a legitimate email".
+confidence_threshold = 0.70
+
+# Truncate e-mail body to this many characters before sending to the LLM.
+# Keeps token costs down; 6500 chars covers most transactional/newsletter mails
+# including a quoted reply chain. Omit this key to fall back to the built-in 3000.
+body_max_chars = 6500
+
+# Hard cap on mails scored per run (safety valve against runaway API costs).
+max_mails_per_run = 200
+
+# Number of mails to score in parallel. Higher = faster, but more API load.
+# 5 is a safe default for cloud LLMs; lower to 1–2 for Ollama on slow hardware.
+max_workers = 5
+
+# Minimum seconds between LLM API calls, enforced per worker. Only throttles
+# bursts: a call that already took longer than this adds no extra delay.
+# Set to 0 to disable.
+sleep_between_requests = 0.5
+
+# ---------------------------------------------------------------------------
+# PMG connection
+# ---------------------------------------------------------------------------
+[pmg]
+# Base URL of your PMG node (include port; no trailing slash)
+url = "https://pmg.example.com:8006"
+
+# PMG credentials (PMG does not support API tokens — ticket-based auth only).
+# Use a dedicated account with the Auditor role. Account types and roles are
+# documented here:
+# https://pmg.proxmox.com/pmg-docs/pmg-admin-guide.html#_user_management
+# Realm is typically "pmg" (local PMG users) or "pam" (Linux PAM users).
+username = "sentinel@pam"
+password = "changeme"
+
+# Set to false to skip TLS verification for self-signed certificates.
+# Do not disable in production — use a proper cert or pin via system trust store.
+verify_ssl = true
+
+
+# ---------------------------------------------------------------------------
+# LLM backend
+# ---------------------------------------------------------------------------
+[llm]
+# Which LLM backend to use: "ollama", "openai", or "claude"
+backend = "claude"
+
+# Model name — examples per backend:
+#   ollama:  "llama3.2", "mistral", "qwen2.5", "phi4-mini"
+#   openai:  "gpt-4o-mini", "gpt-4o"
+#   claude:  "claude-haiku-4-5"    (cost-efficient for bulk scoring)
+#            "claude-opus-4-7"     (highest accuracy, higher cost)
+model = "claude-haiku-4-5"
+
+# Ollama base URL (used only when backend = "ollama")
+ollama_url = "http://localhost:11434"
+
+# API key for OpenAI or Anthropic.
+# Leave empty here and set the environment variable instead:
+#   export OPENAI_API_KEY=sk-...
+#   export ANTHROPIC_API_KEY=sk-ant-...
+api_key = ""
