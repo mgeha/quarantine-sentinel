@@ -1,6 +1,6 @@
 # Quarantine Sentinel
 
-A single-file, out-of-band poller that catches false positives in your
+A small, out-of-band poller that catches false positives in your
 [Proxmox Mail Gateway](https://www.proxmox.com/en/proxmox-mail-gateway)
 quarantine — without ever touching PMG's spam filtering itself.
 
@@ -108,9 +108,41 @@ commented template. Key settings:
 | `lookback_days` | How far back to check quarantine |
 | `confidence_threshold` | Minimum ham-confidence to surface a mail in the digest |
 | `max_mails_per_run` | Cap on LLM calls per run (cached verdicts don't count against it) |
+| `policy_file` | Your own scoring policy, replacing the shipped `default_policy.md` |
 
 `config.toml` and the SQLite database are git-ignored — they contain
 credentials and real mail metadata and should never be committed.
+
+### Scoring policy
+
+The system prompt is assembled from three parts:
+
+```
+[ security boundary + role ]   hard-wired in quarantine_sentinel.py
+[ scoring policy           ]   default_policy.md, or your own policy_file
+[ JSON output contract     ]   hard-wired in quarantine_sentinel.py
+```
+
+Only the middle part is yours to change — the spam and ham signals, how much
+weight authentication failures carry, whether cold outreach counts as spam.
+Copy `default_policy.md`, edit it, and point `policy_file` at your copy; a
+configured file replaces the default rather than extending it. Relative paths
+resolve against the config file's directory, so cron runs find them.
+
+The other two parts are fixed, with different force:
+
+- **Output contract** — enforced by `_parse_llm_json()`, which rejects anything
+  that is not `{verdict ∈ {ham, spam}, confidence, reason}`. Its position at the
+  end of the prompt is only a nudge; the parser is the actual guarantee.
+- **Security boundary** — *not* enforced. It shares one system prompt, one
+  instruction level, with your policy. A policy declaring text inside
+  `EMAIL_DATA` to be instructions contradicts it, and the model decides which
+  wins. The split only prevents deleting the boundary by accident while editing
+  a copied policy file. Guard against oversight, not a security control.
+
+Verdicts are cached per message and are **not** re-scored when the policy
+changes. Each run prints which policy file it used; delete the database if you
+want a clean slate after a rule change.
 
 ## Legal note
 
@@ -127,7 +159,8 @@ policy when it is no longer needed.
 
 ## How it decides
 
-Every backend gets the same system prompt and is asked to return
+Every backend gets the same system prompt (see *Scoring policy* above) and is
+asked to return
 `{"verdict": "ham"|"spam", "confidence": 0.0-1.0, "reason": "..."}`. The
 model sees PMG's own spam-rule hits and authentication results as *context*,
 not as a verdict — it has to explain why a high spam score is or isn't

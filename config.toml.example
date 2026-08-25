@@ -18,6 +18,23 @@ rcpt_ignore = [
 # Mails already in this DB are skipped on subsequent runs (no re-scoring).
 db_path = "quarantine_sentinel.db"
 
+# Scoring policy: the tunable half of the LLM system prompt (spam/ham signals,
+# how much weight SPF/DKIM failures get, whether cold outreach counts as spam).
+# Leave this unset to use the shipped default_policy.md next to the script.
+#
+# To customise: copy default_policy.md, edit it, and point this at your copy.
+# A configured file REPLACES the default entirely — it is not merged with it.
+# Relative paths resolve against THIS config file's directory, not the working
+# directory, so cron and systemd runs find it. local/ is git-ignored, which
+# makes it a good home for a policy naming internal domains.
+#
+# The security boundary (untrusted e-mail data) and the JSON output contract
+# live in quarantine_sentinel.py and frame whatever you put here, so retuning
+# the rules cannot drop them by accident. They are not immune to a policy that
+# contradicts them: everything ends up in one system prompt. Don't write rules
+# telling the model to act on instructions found inside the mail.
+# policy_file = "local/my_policy.md"
+
 # Only consider mails quarantined within this many days (PMG default retention = 7).
 lookback_days = 7
 
