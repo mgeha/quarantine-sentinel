@@ -382,11 +382,253 @@ class AuthenticationContextTests(unittest.TestCase):
         self.assertIn("cannot be forged by the sender", prompt)
         self.assertIn("throwaway.example", prompt)
 
+    def test_prompt_includes_link_hosts_section(self):
+        prompt = qs._build_prompt(
+            {"subject": "account notice"},
+            "Log in to your PayPal account",
+            link_hosts="    1  evil.example",
+        )
+        self.assertIn("Hosts linked or loaded from the body", prompt)
+        self.assertLess(prompt.index("evil.example"), prompt.index("EMAIL_DATA_END"))
+
+    def test_prompt_omits_link_hosts_section_when_empty(self):
+        prompt = qs._build_prompt({"subject": "hi"}, "no links here")
+        self.assertNotIn("Hosts linked", prompt)
+
     def test_system_prompt_covers_impersonation_and_score_magnitude(self):
         self.assertIn("Impersonated organization", _default_prompt())
         self.assertIn("fake-invoice / thread-hijack spam", _default_prompt())
         self.assertIn("own domain", _default_prompt())
         self.assertIn("north of ~15", _default_prompt())
+
+
+def _html_mail(html_body: str, plain_body: str | None = None) -> str:
+    """Build a raw message with an HTML part and an optional text/plain part."""
+    html_part = (
+        "Content-Type: text/html; charset=utf-8\r\n\r\n" f"{html_body}\r\n"
+    )
+    if plain_body is None:
+        return "Subject: test\r\n" + html_part
+    return (
+        "Subject: test\r\nMIME-Version: 1.0\r\n"
+        'Content-Type: multipart/alternative; boundary="b"\r\n\r\n'
+        "--b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"
+        f"{plain_body}\r\n"
+        f"--b\r\n{html_part}--b--\r\n"
+    )
+
+
+def _forwarded_mail() -> str:
+    """A mail with its own HTML body and a forwarded message attached."""
+    return (
+        "Subject: Fwd\r\nMIME-Version: 1.0\r\n"
+        'Content-Type: multipart/mixed; boundary="outer"\r\n\r\n'
+        "--outer\r\nContent-Type: text/html\r\n\r\n"
+        '<a href="https://outer.example/">see attached</a>\r\n'
+        "--outer\r\nContent-Type: message/rfc822\r\n\r\n"
+        "Subject: original\r\nMIME-Version: 1.0\r\n"
+        'Content-Type: multipart/alternative; boundary="inner"\r\n\r\n'
+        "--inner\r\nContent-Type: text/html\r\n\r\n"
+        '<a href="https://nested.example/">nested</a>\r\n'
+        "--inner--\r\n"
+        "--outer--\r\n"
+    )
+
+
+class BodyExtractionTests(unittest.TestCase):
+    def test_html_fallback_drops_style_script_and_comments(self):
+        raw = _html_mail(
+            "<html><head><style>.x { color: red; }</style>"
+            "<script>track()</script></head>"
+            "<body><!-- hidden note --><p>Your invoice</p></body></html>"
+        )
+        text = qs.extract_body_text(raw, 1000)
+        self.assertEqual(text, "Your invoice")
+
+    def test_html_fallback_decodes_entities_after_tag_stripping(self):
+        raw = _html_mail("<p>Fish &amp; Chips &lt;b&gt;&nbsp;now</p>")
+        text = qs.extract_body_text(raw, 1000)
+        self.assertEqual(text, "Fish & Chips <b> now")
+
+    def test_css_does_not_consume_body_budget(self):
+        raw = _html_mail(f"<style>{'a{b:c}' * 500}</style><p>Real content</p>")
+        self.assertEqual(qs.extract_body_text(raw, 50), "Real content")
+
+    def test_text_attachment_is_not_used_as_body(self):
+        raw = (
+            "Subject: t\r\nMIME-Version: 1.0\r\n"
+            'Content-Type: multipart/mixed; boundary="b"\r\n\r\n'
+            "--b\r\nContent-Type: text/html\r\n\r\n<p>Inline text</p>\r\n"
+            "--b\r\nContent-Type: text/plain\r\n"
+            "Content-Disposition: attachment; filename=notes.txt\r\n\r\n"
+            "Attached secret\r\n--b--\r\n"
+        )
+        self.assertEqual(qs.extract_body_text(raw, 1000), "Inline text")
+
+    def test_attachment_only_mail_yields_no_body(self):
+        # Previously fell back to the raw mail: headers plus base64 content.
+        raw = (
+            "Subject: t\r\nMIME-Version: 1.0\r\n"
+            'Content-Type: multipart/mixed; boundary="b"\r\n\r\n'
+            "--b\r\nContent-Type: text/plain\r\n"
+            "Content-Disposition: attachment; filename=notes.txt\r\n\r\n"
+            "Attached secret\r\n--b--\r\n"
+        )
+        self.assertEqual(qs.extract_body_text(raw, 1000), "")
+
+    def test_inline_part_with_filename_counts_as_attachment(self):
+        raw = (
+            "Subject: t\r\nMIME-Version: 1.0\r\n"
+            'Content-Type: multipart/mixed; boundary="b"\r\n\r\n'
+            "--b\r\nContent-Type: text/plain\r\n"
+            "Content-Disposition: inline; filename=notes.txt\r\n\r\n"
+            "Attached secret\r\n"
+            "--b\r\nContent-Type: text/html\r\n\r\n<p>Body</p>\r\n--b--\r\n"
+        )
+        self.assertEqual(qs.extract_body_text(raw, 1000), "Body")
+
+    def test_unknown_charset_falls_back_to_utf8(self):
+        raw = (
+            "Subject: test\r\n"
+            "Content-Type: text/plain; charset=x-no-such-charset\r\n\r\nHello"
+        )
+        self.assertEqual(qs.extract_body_text(raw, 100), "Hello")
+
+
+class LinkHostTests(unittest.TestCase):
+    def test_collects_href_and_src_hosts_ranked_by_count(self):
+        raw = _html_mail(
+            '<a href="https://evil.example/login">PayPal</a>'
+            "<a href='https://evil.example/help'>Help</a>"
+            '<img src="http://pixel.tracker.example/p.gif">'
+        )
+        hosts = qs.extract_link_hosts(raw)
+        self.assertEqual(
+            hosts.splitlines(),
+            ["    2  evil.example", "    1  pixel.tracker.example  (images only)"],
+        )
+
+    def test_link_targets_rank_before_frequent_image_hosts(self):
+        images = "".join(
+            f'<img src="https://img{i}.example/a.gif"><img src="https://img{i}.example/b.gif">'
+            for i in range(qs._MAX_LINK_HOSTS)
+        )
+        raw = _html_mail(images + '<a href="https://phish.example/login">Log in</a>')
+        lines = qs.extract_link_hosts(raw).splitlines()
+        self.assertEqual(lines[0], "    1  phish.example")
+
+    def test_skips_attachments(self):
+        raw = (
+            "Subject: t\r\nMIME-Version: 1.0\r\n"
+            'Content-Type: multipart/mixed; boundary="b"\r\n\r\n'
+            "--b\r\nContent-Type: text/plain\r\n\r\nordinary message\r\n"
+            "--b\r\nContent-Type: text/html\r\n"
+            "Content-Disposition: attachment; filename=report.html\r\n\r\n"
+            '<a href="https://attachment.example/">x</a>\r\n--b--\r\n'
+        )
+        self.assertEqual(qs.extract_link_hosts(raw), "")
+
+    def test_skips_links_inside_attached_message(self):
+        raw = _forwarded_mail()
+        hosts = qs.extract_link_hosts(raw)
+        self.assertIn("outer.example", hosts)
+        self.assertNotIn("nested.example", hosts)
+
+    def test_ignores_data_attributes(self):
+        decoys = "".join(
+            f'<a data-href="https://decoy{i}.example/">x</a>'
+            f'<img data-src="https://decoy{i}.example/i.gif">'
+            for i in range(qs._MAX_LINK_HOSTS)
+        )
+        raw = _html_mail(decoys + '<a href="https://real.example/">Log in</a>')
+        self.assertEqual(qs.extract_link_hosts(raw).splitlines(), ["    1  real.example"])
+
+    def test_rejects_overlong_and_malformed_hosts(self):
+        raw = _html_mail(
+            f'<a href="https://{"a" * 300}.example/">long</a>'
+            '<a href="https://two words.example/">space</a>'
+            '<a href="https://ok.example/">ok</a>'
+        )
+        self.assertEqual(qs.extract_link_hosts(raw).splitlines(), ["    1  ok.example"])
+
+    def test_scans_html_part_even_when_plain_part_exists(self):
+        raw = _html_mail(
+            '<a href="https://real.example/x">Click</a>',
+            plain_body="See https://plain.example/page for details.",
+        )
+        hosts = qs.extract_link_hosts(raw)
+        self.assertIn("real.example", hosts)
+        self.assertIn("plain.example", hosts)
+
+    def test_ignores_non_http_links_and_commented_out_markup(self):
+        raw = _html_mail(
+            '<a href="mailto:a@example.com">Mail</a>'
+            '<img src="cid:logo">'
+            '<a href="/relative">Rel</a>'
+            '<!-- <a href="https://hidden.example/">x</a> -->'
+            '<a href="//proto-relative.example/x">P</a>'
+        )
+        self.assertEqual(
+            qs.extract_link_hosts(raw).splitlines(),
+            ["    1  proto-relative.example"],
+        )
+
+    def test_decodes_entities_and_lowercases_host(self):
+        raw = _html_mail('<a href="https://Click.Example.COM/r?a=1&amp;b=2">x</a>')
+        self.assertIn("click.example.com", qs.extract_link_hosts(raw))
+
+    def test_caps_host_list(self):
+        links = "".join(
+            f'<a href="https://h{i}.example/">x</a>' for i in range(25)
+        )
+        lines = qs.extract_link_hosts(_html_mail(links)).splitlines()
+        self.assertEqual(len(lines), qs._MAX_LINK_HOSTS + 1)
+        self.assertIn("+5 more hosts", lines[-1])
+
+    def test_no_links_yields_empty_string(self):
+        self.assertEqual(qs.extract_link_hosts("Subject: x\r\n\r\nplain"), "")
+        self.assertEqual(qs.extract_link_hosts(""), "")
+
+
+class AttachmentListTests(unittest.TestCase):
+    def test_lists_name_type_and_size_without_content(self):
+        raw = (
+            "Subject: t\r\nMIME-Version: 1.0\r\n"
+            'Content-Type: multipart/mixed; boundary="b"\r\n\r\n'
+            "--b\r\nContent-Type: text/plain\r\n\r\nsee attachment\r\n"
+            "--b\r\nContent-Type: application/octet-stream\r\n"
+            'Content-Disposition: attachment; filename="invoice.pdf.exe"\r\n'
+            "Content-Transfer-Encoding: base64\r\n\r\n"
+            "U0VDUkVUIENPTlRFTlQ=\r\n--b--\r\n"
+        )
+        listing = qs.extract_attachments(raw)
+        self.assertEqual(listing, "  invoice.pdf.exe  (application/octet-stream, 14 B)")
+        self.assertNotIn("SECRET", listing)
+
+    def test_decodes_encoded_word_filename(self):
+        raw = (
+            "Subject: t\r\nMIME-Version: 1.0\r\n"
+            'Content-Type: multipart/mixed; boundary="b"\r\n\r\n'
+            "--b\r\nContent-Type: application/pdf\r\n"
+            'Content-Disposition: attachment; filename="=?utf-8?q?Rechnung_M=C3=A4rz.pdf?="'
+            "\r\n\r\nx\r\n--b--\r\n"
+        )
+        self.assertIn("Rechnung März.pdf", qs.extract_attachments(raw))
+
+    def test_attached_message_is_listed_but_not_descended(self):
+        listing = qs.extract_attachments(_forwarded_mail())
+        self.assertEqual(listing, "  (unnamed)  (message/rfc822)")
+
+    def test_no_attachments_yields_empty_string(self):
+        self.assertEqual(qs.extract_attachments("Subject: x\r\n\r\nplain"), "")
+
+    def test_prompt_includes_attachment_section(self):
+        prompt = qs._build_prompt(
+            {"subject": "invoice"}, "",
+            attachments="  invoice.pdf.exe  (application/octet-stream, 14 B)",
+        )
+        self.assertIn("content not included", prompt)
+        self.assertLess(prompt.index("invoice.pdf.exe"), prompt.index("EMAIL_DATA_END"))
 
 
 class LLMResponseParsingTests(unittest.TestCase):

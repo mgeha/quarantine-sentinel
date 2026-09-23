@@ -22,7 +22,9 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import email as email_mod
+import email.header
 import email.policy
+import html
 import json
 import math
 import os
@@ -582,32 +584,207 @@ def extract_sending_infra(raw_mail: str) -> str:
     return re.sub(r"\s+", " ", match.group(1)).strip()
 
 
+# Markup whose content is never rendered as text. Newsletter templates often
+# open with kilobytes of CSS, which would otherwise fill the body_max_chars budget.
+_HTML_INVISIBLE = re.compile(
+    r"<(script|style)\b.*?</\1\s*>|<!--.*?-->", re.IGNORECASE | re.DOTALL
+)
+# The lookbehind rejects data-href / data-src: mail clients never follow those.
+_HTML_URL_ATTR = re.compile(
+    r"""(?<![\w-])(href|src)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""",
+    re.IGNORECASE,
+)
+_PLAIN_URL = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
+# Caps length and character set so each entry stays short and on one line.
+# Not a full DNS-name check; \w admits IDN labels.
+_VALID_HOST = re.compile(r"[\w.:-]{1,253}")
+_MAX_LINK_HOSTS = 20
+_MAX_ATTACHMENTS = 20
+_MAX_FILENAME_CHARS = 100
+
+
+def _decode_part(part: Any) -> str:
+    """Decoded text of a MIME part; an unknown charset falls back to UTF-8."""
+    payload = part.get_payload(decode=True)
+    if not payload:
+        return ""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except LookupError:
+        return payload.decode("utf-8", errors="replace")
+
+
+def _is_attachment(part: Any) -> bool:
+    """Whether *part* is attached rather than part of the message body.
+
+    A filename counts too: some clients send attachments as "inline".
+    An attached e-mail is message/rfc822, often without any disposition.
+    """
+    return (
+        part.get_content_disposition() == "attachment"
+        or part.get_filename() is not None
+        or part.get_content_type() == "message/rfc822"
+    )
+
+
+def _body_parts(part: Any, content_type: str) -> Any:
+    """Yield the body's parts of *content_type*, skipping attachments.
+
+    Prunes an attachment's whole subtree: the text parts inside a forwarded
+    message carry no disposition of their own.
+    """
+    if _is_attachment(part):
+        return
+    if part.is_multipart():
+        for child in part.get_payload():
+            yield from _body_parts(child, content_type)
+    elif part.get_content_type() == content_type:
+        yield part
+
+
+def _html_to_text(html_text: str) -> str:
+    """Visible text of an HTML part: no script/style/comments, entities decoded."""
+    text = _HTML_INVISIBLE.sub(" ", html_text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    # Unescape after stripping tags, so an encoded "&lt;b&gt;" survives as text.
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def extract_body_text(raw_mail: str, max_chars: int) -> str:
-    """Extract readable plain text from a raw RFC-2822 message."""
+    """Extract readable plain text from a raw RFC-2822 message.
+
+    Returns "" when there is no text body, e.g. an attachment-only mail. The
+    raw message is never a fallback: it would send headers and base64
+    attachment content to the LLM.
+    """
     if not raw_mail:
         return ""
     try:
         msg = email_mod.message_from_string(raw_mail, policy=email_mod.policy.compat32)
         # Prefer text/plain
-        for part in msg.walk():
-            if part.get_content_type() == "text/plain":
-                payload = part.get_payload(decode=True)
-                if payload:
-                    charset = part.get_content_charset() or "utf-8"
-                    return payload.decode(charset, errors="replace")[:max_chars]
+        for part in _body_parts(msg, "text/plain"):
+            text = _decode_part(part)
+            if text:
+                return text[:max_chars]
         # Fall back to text/html with tag stripping
-        for part in msg.walk():
-            if part.get_content_type() == "text/html":
-                payload = part.get_payload(decode=True)
-                if payload:
-                    charset = part.get_content_charset() or "utf-8"
-                    html_text = payload.decode(charset, errors="replace")
-                    text = re.sub(r"<[^>]+>", " ", html_text)
-                    text = re.sub(r"\s+", " ", text).strip()
-                    return text[:max_chars]
+        for part in _body_parts(msg, "text/html"):
+            text = _decode_part(part)
+            if text:
+                return _html_to_text(text)[:max_chars]
     except Exception:
-        pass  # malformed MIME — fall through to raw fallback below
-    return raw_mail[:max_chars]
+        pass  # malformed MIME — treated as no text body
+    return ""
+
+
+def _format_size(size: int) -> str:
+    return f"{size} B" if size < 1024 else f"{size / 1024:.0f} KB"
+
+
+def _attachment_name(part: Any) -> str:
+    """Decoded, single-line, length-capped filename of *part*."""
+    name = part.get_filename() or ""
+    try:
+        # compat32 decodes RFC 2231 names but leaves =?utf-8?...?= words.
+        name = str(email_mod.header.make_header(email_mod.header.decode_header(name)))
+    except Exception:
+        pass
+    name = _scrub(name).strip()
+    if len(name) > _MAX_FILENAME_CHARS:
+        name = name[:_MAX_FILENAME_CHARS] + "…"
+    return name or "(unnamed)"
+
+
+def extract_attachments(raw_mail: str) -> str:
+    """List attachment names, types and sizes — never their content.
+
+    An attachment-only mail has no body text to judge, and a name such as
+    "invoice.pdf.exe" is evidence in itself.
+    """
+    if not raw_mail:
+        return ""
+    lines: list[str] = []
+
+    def visit(part: Any) -> None:
+        if _is_attachment(part):
+            detail = part.get_content_type()
+            if not part.is_multipart():
+                payload = part.get_payload(decode=True) or b""
+                detail += f", {_format_size(len(payload))}"
+            lines.append(f"  {_attachment_name(part)}  ({detail})")
+            return  # an attached message's own attachments stay unlisted
+        if part.is_multipart():
+            for child in part.get_payload():
+                visit(child)
+
+    try:
+        visit(email_mod.message_from_string(raw_mail, policy=email_mod.policy.compat32))
+    except Exception:
+        return ""
+    if len(lines) > _MAX_ATTACHMENTS:
+        extra = len(lines) - _MAX_ATTACHMENTS
+        lines = lines[:_MAX_ATTACHMENTS] + [f"  (+{extra} more attachments)"]
+    return "\n".join(lines)
+
+
+def _url_host(url: str) -> str:
+    """Host of an http(s) URL; mailto:, cid:, relative links and junk yield ""."""
+    url = url.strip()
+    if url.startswith("//"):
+        url = "http:" + url
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ""
+    except ValueError:
+        return ""
+    if parts.scheme.lower() not in ("http", "https"):
+        return ""
+    host = host.rstrip(".")
+    return host if _VALID_HOST.fullmatch(host) else ""
+
+
+def extract_link_hosts(raw_mail: str) -> str:
+    """Return the hosts that body links and images point to.
+
+    Tag stripping drops every href/src, so the LLM would otherwise see link
+    text but never where it leads. Link targets rank before image-only hosts:
+    a single phishing link must not be pushed past the cap by tracking pixels.
+    """
+    if not raw_mail:
+        return ""
+    links: dict[str, int] = {}
+    images: dict[str, int] = {}
+    try:
+        msg = email_mod.message_from_string(raw_mail, policy=email_mod.policy.compat32)
+        found: list[tuple[str, str]] = []  # (attribute, url)
+        for part in _body_parts(msg, "text/html"):
+            text = _HTML_INVISIBLE.sub(" ", _decode_part(part))
+            for m in _HTML_URL_ATTR.finditer(text):
+                value = next(g for g in m.groups()[1:] if g is not None)
+                found.append((m.group(1).lower(), html.unescape(value)))
+        for part in _body_parts(msg, "text/plain"):
+            found.extend(("href", url) for url in _PLAIN_URL.findall(_decode_part(part)))
+        for attribute, url in found:
+            host = _url_host(url)
+            if host:
+                counts = links if attribute == "href" else images
+                counts[host] = counts.get(host, 0) + 1
+    except Exception:
+        return ""
+    ranked = sorted(links.items(), key=lambda item: item[1], reverse=True)
+    ranked += sorted(
+        ((host, n) for host, n in images.items() if host not in links),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    lines = [
+        f"  {n:>3}  {host}" + ("" if host in links else "  (images only)")
+        for host, n in ranked[:_MAX_LINK_HOSTS]
+    ]
+    if len(ranked) > _MAX_LINK_HOSTS:
+        lines.append(f"  (+{len(ranked) - _MAX_LINK_HOSTS} more hosts)")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +824,8 @@ def _build_prompt(
     spam_rules: str = "",
     authentication_results: str = "",
     sending_infra: str = "",
+    link_hosts: str = "",
+    attachments: str = "",
 ) -> str:
     from_addr  = meta.get("from", "unknown")
     to_addr    = meta.get("receiver") or meta.get("to", "unknown")
@@ -675,6 +854,16 @@ def _build_prompt(
         f"{sending_infra}"
         if sending_infra else ""
     )
+    links_section = (
+        "\n--- Hosts linked or loaded from the body (count, host; the body text "
+        f"below shows link text only) ---\n{link_hosts}"
+        if link_hosts else ""
+    )
+    attachments_section = (
+        "\n--- Attachments (name, type, size; content not included) ---\n"
+        f"{attachments}"
+        if attachments else ""
+    )
     return (
         "EMAIL_DATA_BEGIN\n"
         f"From:    {from_addr}\n"
@@ -684,7 +873,9 @@ def _build_prompt(
         f"Spam score: {score}  (spamlevel {spamlevel})"
         f"{rules_section}"
         f"{auth_section}"
-        f"{infra_section}\n"
+        f"{infra_section}"
+        f"{links_section}"
+        f"{attachments_section}\n"
         f"\n--- Body ---\n{body_text or '(empty)'}\n"
         "EMAIL_DATA_END"
     )
@@ -858,10 +1049,13 @@ def score_mail(
     spam_rules: str = "",
     authentication_results: str = "",
     sending_infra: str = "",
+    link_hosts: str = "",
+    attachments: str = "",
 ) -> dict[str, Any]:
     """Return {verdict, confidence, reason}; retries once on JSON parse failure."""
     prompt = _build_prompt(
-        meta, body_text, spam_rules, authentication_results, sending_infra
+        meta, body_text, spam_rules, authentication_results, sending_infra,
+        link_hosts, attachments,
     )
     try:
         return _score_once(prompt, cfg)
@@ -1101,10 +1295,12 @@ def _run(
         spam_rules = extract_spam_rules(raw)
         authentication_results = extract_authentication_results(raw)
         sending_infra = extract_sending_infra(raw)
+        link_hosts = extract_link_hosts(raw)
+        attachments = extract_attachments(raw)
         try:
             result = score_mail(
                 meta, body_text, cfg, spam_rules, authentication_results,
-                sending_infra,
+                sending_infra, link_hosts, attachments,
             )
         except FatalLLMError as exc:
             _warn(f"Fatal LLM error ({type(exc).__name__}): {_scrub(exc)} — aborting remaining scoring")

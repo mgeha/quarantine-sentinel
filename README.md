@@ -147,11 +147,13 @@ want a clean slate after a rule change.
 ## Legal note
 
 Using a cloud LLM backend (OpenAI, Anthropic) sends message metadata,
-authentication and spam-filter context, and a text-body excerpt limited by
-`body_max_chars` to a third party. Attachments are not sent to the LLM. Check
-GDPR / data protection requirements with your legal team before pointing this
-at a mailbox with real user data. Use an on-premises Ollama instance to keep
-LLM processing within your own infrastructure.
+authentication and spam-filter context, the hosts that body links and images
+point to, and a text-body excerpt limited by `body_max_chars` to a third
+party. Of attachments, including attached e-mails, only name, type and size
+are sent — never their content. Check GDPR / data protection requirements
+with your legal team before pointing this at a mailbox with real user data.
+Use an on-premises Ollama instance to keep LLM processing within your own
+infrastructure.
 
 Verdicts and selected message metadata are stored in the local SQLite database.
 Protect this file accordingly and delete it according to your data-retention
