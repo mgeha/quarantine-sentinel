@@ -89,9 +89,15 @@ backend = "claude"
 # Model name — examples per backend:
 #   ollama:  "llama3.2", "mistral", "qwen2.5", "phi4-mini"
 #   openai:  "gpt-4o-mini", "gpt-4o"
-#   claude:  "claude-haiku-4-5"    (cost-efficient for bulk scoring)
-#            "claude-opus-4-7"     (highest accuracy, higher cost)
-model = "claude-haiku-4-5"
+#   claude:  "claude-haiku-5-5"   (cost-efficient for bulk scoring)
+#            "claude-opus-5-5"    (higher-capability alternative, higher cost)
+model = "claude-haiku-5-5"
+
+# Thinking effort (claude backend only): "low", "medium", "high", "xhigh", "max".
+# Omit to use the model's default. Start with "low" for lower cost and latency;
+# validate classification quality on representative mail.
+# Leave unset for claude-haiku-4-5, which rejects this parameter.
+effort = "low"
 
 # Ollama base URL (used only when backend = "ollama")
 ollama_url = "http://localhost:11434"

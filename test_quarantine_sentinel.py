@@ -177,6 +177,20 @@ class ConfigValidationTests(unittest.TestCase):
             with self.subTest(key=key):
                 self._assert_config_rejected(self._config(llm={key: "11434"}), needle)
 
+    def test_rejects_unknown_effort(self):
+        self._assert_config_rejected(
+            self._config(llm={"effort": '"minimal"'}), "[llm].effort must be one of"
+        )
+
+    def test_effort_defaults_to_unset_and_is_normalised(self):
+        for value, expected in ((None, ""), ('"LOW"', "low")):
+            with self.subTest(value=value):
+                llm = {"effort": value} if value else {}
+                with TemporaryDirectory() as directory:
+                    path = Path(directory) / "config.toml"
+                    path.write_text(self._config(llm=llm), encoding="utf-8")
+                    self.assertEqual(qs.load_config(str(path)).llm_effort, expected)
+
     def test_rejects_stringly_typed_verify_ssl(self):
         # bool("false") is True, the exact opposite of what was configured.
         self._assert_config_rejected(
@@ -701,6 +715,7 @@ def _config(**overrides):
         "llm_model": "m",
         "llm_ollama_url": "http://localhost:11434",
         "llm_api_key": "",
+        "llm_effort": "",
         "db_path": Path("unused.db"),
         "lookback_days": 7,
         "confidence_threshold": 0.70,

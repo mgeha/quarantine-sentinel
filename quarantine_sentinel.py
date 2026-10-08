@@ -65,6 +65,7 @@ class Config:
     llm_model: str
     llm_ollama_url: str
     llm_api_key: str
+    llm_effort: str         # claude only; "" = not sent (model default)
 
     # Runtime
     db_path: Path
@@ -81,6 +82,9 @@ class Config:
     system_prompt: str      # boundary + policy + output contract, composed
 
 
+_CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
 def load_config(path: str) -> Config:
     config_path = Path(path)
     with open(path, "rb") as fh:
@@ -92,6 +96,10 @@ def load_config(path: str) -> Config:
     backend = _parse_str(llm, "backend", section="llm").lower()
     if backend not in ("ollama", "openai", "claude"):
         sys.exit("[llm].backend must be one of: ollama, openai, claude")
+
+    effort = _parse_str(llm, "effort", default="", section="llm").lower()
+    if effort not in ("", *_CLAUDE_EFFORTS):
+        sys.exit(f"[llm].effort must be one of: {', '.join(_CLAUDE_EFFORTS)}")
 
     policy, policy_path = _load_policy(raw, config_path)
 
@@ -106,6 +114,7 @@ def load_config(path: str) -> Config:
             llm, "ollama_url", default="http://localhost:11434", section="llm"
         ).rstrip("/"),
         llm_api_key=_parse_str(llm, "api_key", default="", section="llm"),
+        llm_effort=effort,
         db_path=Path(_parse_str(raw, "db_path", default="quarantine_sentinel.db")),
         lookback_days=_parse_int(raw, "lookback_days", 7, minimum=1),
         confidence_threshold=_parse_float(
@@ -992,12 +1001,19 @@ def _score_claude(prompt: str, cfg: Config) -> dict[str, Any]:
         sys.exit("Claude backend requires:  pip install anthropic")
 
     client = anthropic.Anthropic(api_key=cfg.llm_api_key or None)
+    # Older models (e.g. claude-haiku-4-5) reject `effort`, so only send it when set.
+    extra: dict[str, Any] = {}
+    if cfg.llm_effort:
+        extra["output_config"] = {"effort": cfg.llm_effort}
     try:
         response = client.messages.create(
             model=cfg.llm_model,
-            max_tokens=512,
+            # Thinking tokens count toward max_tokens on adaptive-thinking models;
+            # too small a cap ends the turn before the JSON verdict is written.
+            max_tokens=4096,
             system=cfg.system_prompt,
             messages=[{"role": "user", "content": prompt}],
+            **extra,
         )
     except (
         anthropic.AuthenticationError,
@@ -1009,7 +1025,10 @@ def _score_claude(prompt: str, cfg: Config) -> dict[str, Any]:
     for block in response.content:
         if block.type == "text":
             return _parse_llm_json(block.text)
-    raise ValueError("Claude returned no text block in response")
+    # e.g. stop_reason "refusal" (safety classifier) or "max_tokens" mid-thinking
+    raise ValueError(
+        f"Claude returned no text block (stop_reason={response.stop_reason})"
+    )
 
 
 # Per-worker LLM pacing. ThreadPoolExecutor reuses its threads for the whole

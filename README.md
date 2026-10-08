@@ -62,7 +62,7 @@ The following digest uses fictional addresses and message data:
   PMG Quarantine False-Positive Report — 2026-08-24 09:42 UTC
 ========================================================================
   Mails in scope : 4  (3 scored this run, 1 from cache)
-  LLM            : claude / claude-haiku-4-5
+  LLM            : claude / claude-haiku-5-5
   Threshold      : ham confidence >= 70%
 
   LIKELY FALSE POSITIVES  (2 mail(s) above threshold):
@@ -103,7 +103,7 @@ commented template. Key settings:
 | Setting | Purpose |
 |---|---|
 | `[pmg]` | PMG URL and credentials (a dedicated account is recommended) |
-| `[llm]` | Backend (`ollama` / `openai` / `claude`), model, API key |
+| `[llm]` | Backend (`ollama` / `openai` / `claude`), model, API key, thinking `effort` (Claude only) |
 | `rcpt_ignore` | Recipient addresses skipped locally before any mail is fetched or scored |
 | `lookback_days` | How far back to check quarantine |
 | `confidence_threshold` | Minimum ham-confidence to surface a mail in the digest |
