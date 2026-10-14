@@ -819,7 +819,7 @@ a message."""
 _PROMPT_CONTRACT = """Return ONLY a JSON object with:
   "verdict"    — "ham" or "spam"
   "confidence" — float 0.0 (uncertain) to 1.0 (certain)
-  "reason"     — one or two sentences citing the decisive signals"""
+  "reason"     — at most two sentences (under 300 characters) citing the decisive signals"""
 
 
 def _compose_system_prompt(policy: str) -> str:
@@ -933,8 +933,8 @@ def _parse_llm_json(text: str) -> dict[str, Any]:
     reason = str(obj.get("reason", "")).strip()
     if not reason:
         raise ValueError("LLM response has empty reason")
-    if len(reason) > 500:
-        reason = reason[:500] + "…"
+    if len(reason) > 1500:
+        reason = reason[:1500] + "…"
     return {"verdict": verdict, "confidence": confidence, "reason": reason}
 
 
